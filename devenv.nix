@@ -67,6 +67,7 @@ in
     ++ unstableQtPkgs
     ++ [
       unstablePkgs.bitwarden-cli
+      unstablePkgs.python314Packages.osc
     ];
 
   # https://devenv.sh/git-hooks/

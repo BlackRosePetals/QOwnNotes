@@ -19,6 +19,8 @@
 - Fixed notes with duplicate names in the same subfolder potentially overwriting each
   other's content, and prevented duplicate image and attachment copies during Joplin imports
   (for [#3726](https://github.com/pbek/QOwnNotes/pull/3726), thank you, @MySkeletonHurts)
+- Added Qt6 Open Build Service configurations for Fedora, openSUSE, and Arch Linux
+  (for [#3727](https://github.com/pbek/QOwnNotes/issues/3727))
 - Added more French translation (thank you, jd-develop)
 
 ## 26.9.1

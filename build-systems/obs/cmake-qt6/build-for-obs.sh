@@ -59,6 +59,10 @@ echo '#define RELEASE "OBS"' >src/release.h
 # replace the version in the dsc file
 sed -i "s/VERSION-STRING/$QOWNNOTES_VERSION/g" "$buildSystemPath/qownnotes.dsc"
 
+# replace the version in the RPM and Arch build files
+sed -i "s/VERSION-STRING/$QOWNNOTES_VERSION/g" "$buildSystemPath/qownnotes.spec"
+sed -i "s/VERSION-STRING/$QOWNNOTES_VERSION/g" "$buildSystemPath/PKGBUILD"
+
 changelogText="Released version $QOWNNOTES_VERSION"
 
 echo "Using version $QOWNNOTES_VERSION..."
@@ -131,6 +135,8 @@ cp "$buildSystemPath/debian.rules" "$obsRepoPath"
 cp "$buildSystemPath/debian.qownnotes.install" "$obsRepoPath"
 cp "$buildSystemPath/qownnotes.dsc" "$obsRepoPath"
 cp "$buildSystemPath/debian.qownnotes-l10n.install" "$obsRepoPath"
+cp "$buildSystemPath/qownnotes.spec" "$obsRepoPath"
+cp "$buildSystemPath/PKGBUILD" "$obsRepoPath"
 
 cd "$obsRepoPath" || exit 1
 
