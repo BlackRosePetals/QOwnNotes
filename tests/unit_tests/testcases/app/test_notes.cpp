@@ -17,11 +17,16 @@
 #include "entities/bookmark.h"
 #include "entities/commandsnippet.h"
 #include "entities/notesubfolder.h"
+#include "entities/trashitem.h"
 #include "services/settingsservice.h"
 #include "utils/urlhandler.h"
 
 #if QT_VERSION >= QT_VERSION_CHECK(5, 10, 0)
 #include <QRandomGenerator>
+#endif
+
+#ifdef Q_OS_UNIX
+#include <unistd.h>
 #endif
 
 #include "helpers/codetohtmlconverter.h"
@@ -1419,6 +1424,362 @@ void TestNotes::testCommandSnippetsKeepNearestHeadingForCodeBlocks() {
              QStringLiteral("aktuelles Datum"));
     QCOMPARE(whoSnippet.value(QStringLiteral("description")).toString(), QStringLiteral("Wer?"));
     QCOMPARE(lsSnippet.value(QStringLiteral("description")).toString(), QStringLiteral("Test 2b"));
+}
+
+/**
+ * Duplicate-title-collision fix, found via Joplin-import validation but not
+ * import-specific: it affects any note creation/rename in the app.
+ *
+ * Before the fix, Note::handleNoteTextFileName()'s duplicate-avoidance loop
+ * called Note::fetchByFileName(fileName) with no explicit subfolder, which
+ * resolved to NoteSubFolder::activeNoteSubFolderId() -- the UI's currently
+ * active subfolder, not the subfolder the note is actually being written
+ * into. Combined with canWriteToNoteFile() probing writability by opening
+ * QIODevice::WriteOnly (which truncates an existing file), two notes with an
+ * identical title landing in the same *non-active* subfolder (e.g. a Joplin
+ * notebook import) would silently destroy one another's content instead of
+ * the second being suffixed away from the collision.
+ *
+ * This reproduces the exact sequence JoplinImportDialog::importNote()
+ * performs and asserts the *fixed* (correct) outcome: note B gets suffixed,
+ * note A's file and content are left untouched.
+ */
+void TestNotes::testDuplicateTitleInNonActiveSubfolderGetsSuffixedNotOverwritten() {
+    // The trashItem table lives in the per-note-folder database, which
+    // initTestCase() never sets up (only the "memory" note/tag/subfolder
+    // tables); the real app does this at startup (see
+    // NoteIndexManager::buildNotesIndex(), noteindexmanager.cpp:354-355).
+    DatabaseService::createNoteFolderConnection();
+    DatabaseService::setupNoteFolderTables();
+
+    NoteSubFolder targetFolder =
+        createTestNoteSubFolder(uniqueTestName(QStringLiteral("joplin-notebook")));
+
+    // Sanity check on the premise: the folder notes are being imported into
+    // is not the UI's "active" subfolder, exactly as during a real import.
+    QVERIFY(NoteSubFolder::activeNoteSubFolderId() != targetFolder.getId());
+
+    const QString title = uniqueTestName(QStringLiteral("Duplicate Title"));
+
+    // --- Note A: imported first, writes cleanly ---
+    Note noteA;
+    noteA.setNoteSubFolder(targetFolder);
+    noteA.setNoteText(QStringLiteral("# %1\n\nContent A\n").arg(title));
+    QVERIFY(noteA.handleNoteTextFileName());
+    QVERIFY(noteA.store());
+    QVERIFY(noteA.storeNoteTextFileToDisk());
+
+    const QString noteAFileName = noteA.getFileName();
+    const QString noteAFilePath = noteA.fullNoteFilePath();
+    QVERIFY2(QFile::exists(noteAFilePath), "note A's file should exist after its own write");
+    const qint64 noteAOriginalSize = QFileInfo(noteAFilePath).size();
+    QVERIFY(noteAOriginalSize > 0);
+
+    // --- Note B: same title, same target subfolder ---
+    Note noteB;
+    noteB.setNoteSubFolder(targetFolder);
+    noteB.setNoteText(QStringLiteral("# %1\n\nContent B\n").arg(title));
+
+    // FIXED: the collision-avoidance loop now scopes the check to this
+    // note's own target subfolder, so it correctly finds note A and
+    // suffixes note B's name away from the collision.
+    QVERIFY(noteB.handleNoteTextFileName());
+    QVERIFY2(noteB.getFileName() != noteAFileName,
+             "note B should be suffixed away from note A's colliding name");
+
+    // FIXED: canWriteToNoteFile()'s writability probe no longer truncates
+    // note A's file as a side effect (it isn't even the same file anymore,
+    // but assert the content survived regardless).
+    QFile fileAAfterCollisionCheck(noteAFilePath);
+    QVERIFY(fileAAfterCollisionCheck.exists());
+    QCOMPARE(fileAAfterCollisionCheck.size(), noteAOriginalSize);
+
+    QVERIFY(noteB.store());
+    QVERIFY(noteB.storeNoteTextFileToDisk());
+
+    // Both notes now have their own distinct file, each with its own
+    // content intact.
+    QFile fileA(noteAFilePath);
+    QVERIFY(fileA.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString contentsA = QString::fromUtf8(fileA.readAll());
+    fileA.close();
+    QVERIFY(contentsA.contains(QStringLiteral("Content A")));
+    QVERIFY(!contentsA.contains(QStringLiteral("Content B")));
+
+    QFile fileB(noteB.fullNoteFilePath());
+    QVERIFY(fileB.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString contentsB = QString::fromUtf8(fileB.readAll());
+    fileB.close();
+    QVERIFY(contentsB.contains(QStringLiteral("Content B")));
+    QVERIFY(!contentsB.contains(QStringLiteral("Content A")));
+
+    // Two independent, non-colliding DB rows, correctly scoped to the same
+    // subfolder but with distinct file names.
+    const Note refetchedA = Note::fetch(noteA.getId());
+    const Note refetchedB = Note::fetch(noteB.getId());
+    QVERIFY(refetchedA.isFetched());
+    QVERIFY(refetchedB.isFetched());
+    QVERIFY(refetchedA.getFileName() != refetchedB.getFileName());
+    QCOMPARE(refetchedA.getNoteSubFolderId(), refetchedB.getNoteSubFolderId());
+
+    // No trash entry was needed -- there was no collision left to clean up.
+    QCOMPARE(TrashItem::countAll(), 0);
+}
+
+/**
+ * Regression check for the fix above: the far more common case (two notes
+ * with an identical title created directly in the currently *active*
+ * subfolder, e.g. plain in-app note creation, no import involved) must keep
+ * working exactly as before -- the second note still gets suffixed.
+ */
+void TestNotes::testDuplicateTitleInActiveSubfolderStillGetsSuffixed() {
+    QVERIFY(NoteSubFolder::activeNoteSubFolderId() == 0);
+
+    const QString title = uniqueTestName(QStringLiteral("Active Folder Duplicate"));
+
+    Note noteA;
+    noteA.setNoteText(QStringLiteral("# %1\n\nContent A\n").arg(title));
+    QVERIFY(noteA.handleNoteTextFileName());
+    QVERIFY(noteA.store());
+    QVERIFY(noteA.storeNoteTextFileToDisk());
+
+    Note noteB;
+    noteB.setNoteText(QStringLiteral("# %1\n\nContent B\n").arg(title));
+    QVERIFY(noteB.handleNoteTextFileName());
+
+    QVERIFY2(noteB.getFileName() != noteA.getFileName(),
+             "duplicate titles in the active subfolder must still be suffixed apart");
+    QVERIFY(noteB.getName().startsWith(title));
+}
+
+/**
+ * Answers a direct question: can the duplicate-title bug's *sibling*
+ * manifest outside of import, via the app's ordinary "Rename note" action
+ * (or the scripting API's rename)? Note::renameNoteFile() has the exact same
+ * unscoped Note::fetchByName(newName) pattern (note.cpp ~3697), resolving to
+ * NoteSubFolder::activeNoteSubFolderId() rather than this note's own
+ * subfolder.
+ *
+ * Unlike handleNoteTextFileName()'s canWriteToNoteFile() probe, this does
+ * NOT destroy the other note's content: renameNoteFile()'s final step is
+ * QFile::rename(), and direct testing confirms Qt's QFile::rename() safely
+ * *refuses* when the destination already exists (returns false, error
+ * "Destination file exists", touching neither file). So the practical bug
+ * here is narrower than data loss: before the fix, the wrong-scope check
+ * produces a false negative, letting _fileName/_name/store() run for a name
+ * that DOES already exist in this note's actual subfolder -- only the final
+ * file.rename() call stops the operation, by which point the DB row would
+ * already claim a file_name that the rename never actually produced on
+ * disk. The fix makes the existence check correct up front, so the whole
+ * rename is refused cleanly, before anything is mutated.
+ */
+void TestNotes::testRenameNoteFileToExistingNameInNonActiveSubfolder() {
+    NoteSubFolder targetFolder =
+        createTestNoteSubFolder(uniqueTestName(QStringLiteral("some-notebook")));
+    QVERIFY(NoteSubFolder::activeNoteSubFolderId() != targetFolder.getId());
+
+    const QString existingName = uniqueTestName(QStringLiteral("Existing Note"));
+    Note noteA;
+    noteA.setNoteSubFolder(targetFolder);
+    noteA.setNoteText(
+        QStringLiteral("# %1\n\nOriginal content, not involved in any rename\n").arg(existingName));
+    QVERIFY(noteA.handleNoteTextFileName());
+    QVERIFY(noteA.store());
+    QVERIFY(noteA.storeNoteTextFileToDisk());
+
+    const QString noteAFilePath = noteA.fullNoteFilePath();
+    QVERIFY(QFile::exists(noteAFilePath));
+
+    const QString otherName = uniqueTestName(QStringLiteral("Some Other Note"));
+    Note noteB;
+    noteB.setNoteSubFolder(targetFolder);
+    noteB.setNoteText(QStringLiteral("# %1\n\nAbout to be renamed\n").arg(otherName));
+    QVERIFY(noteB.handleNoteTextFileName());
+    QVERIFY(noteB.store());
+    QVERIFY(noteB.storeNoteTextFileToDisk());
+    const QString noteBFileNameBefore = noteB.getFileName();
+    const QString noteBFilePath = noteB.fullNoteFilePath();
+
+    // FIXED: correctly detects the real collision in note B's own subfolder
+    // and refuses the rename outright, before mutating anything.
+    QVERIFY2(!noteB.renameNoteFile(existingName),
+             "renaming onto an existing note's name in the same subfolder must be refused");
+
+    // Nothing was mutated by the refused attempt: note B still has its own
+    // original name/file, note A's file is completely untouched.
+    QCOMPARE(noteB.getFileName(), noteBFileNameBefore);
+    QVERIFY(QFile::exists(noteBFilePath));
+
+    QFile fileA(noteAFilePath);
+    QVERIFY(fileA.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString contentsA = QString::fromUtf8(fileA.readAll());
+    fileA.close();
+    QVERIFY(contentsA.contains(QStringLiteral("Original content")));
+}
+
+/**
+ * The far more common real-world trigger than Note::renameNoteFile(): since
+ * QOwnNotes derives a note's name from the first line of its own Markdown
+ * text, simply editing an EXISTING note's title (in the normal editor, no
+ * dedicated "Rename" action, no import) to match another existing note's
+ * title in the same *non-active* subfolder goes through
+ * storeNoteTextFileToDisk() -> handleNoteTextFileName() ->
+ * canWriteToNoteFile() -- the exact same truncate-as-a-side-effect path
+ * traced for Joplin import. Unlike renameNoteFile()'s QFile::rename() (which
+ * safely refuses when the destination already exists, per direct testing:
+ * QFile::rename returns false with "Destination file exists" and touches
+ * neither file), canWriteToNoteFile() opens the colliding path directly with
+ * QIODevice::WriteOnly, which has no such existence check and destroys the
+ * target's content before any rename is even attempted.
+ */
+void TestNotes::testEditingExistingNoteTitleToMatchAnotherNoteDestroysItsContent() {
+    NoteSubFolder targetFolder =
+        createTestNoteSubFolder(uniqueTestName(QStringLiteral("another-notebook")));
+    QVERIFY(NoteSubFolder::activeNoteSubFolderId() != targetFolder.getId());
+
+    const QString victimTitle = uniqueTestName(QStringLiteral("Victim Note"));
+    Note victim;
+    victim.setNoteSubFolder(targetFolder);
+    victim.setNoteText(
+        QStringLiteral("# %1\n\nImportant content nobody is touching\n").arg(victimTitle));
+    QVERIFY(victim.handleNoteTextFileName());
+    QVERIFY(victim.store());
+    QVERIFY(victim.storeNoteTextFileToDisk());
+
+    const QString victimFilePath = victim.fullNoteFilePath();
+    QVERIFY(QFile::exists(victimFilePath));
+    QVERIFY(QFileInfo(victimFilePath).size() > 0);
+
+    // A second, pre-existing note in the same subfolder, being edited by the
+    // user -- nothing to do with the victim, no import, no dedicated rename
+    // action. The user just retitles it (e.g. a typo fix, or copy-pasting a
+    // heading) to something that happens to already exist in this notebook.
+    const QString editedTitle = uniqueTestName(QStringLiteral("Being Edited"));
+    Note edited;
+    edited.setNoteSubFolder(targetFolder);
+    edited.setNoteText(QStringLiteral("# %1\n\nOriginal text before the edit\n").arg(editedTitle));
+    QVERIFY(edited.handleNoteTextFileName());
+    QVERIFY(edited.store());
+    QVERIFY(edited.storeNoteTextFileToDisk());
+
+    // The user edits the first line of "edited" to the victim's title and
+    // saves -- ordinary editing, the app's normal live-save path.
+    edited.setNoteText(QStringLiteral("# %1\n\nText after the retitle\n").arg(victimTitle));
+    bool currentNoteTextChanged = false;
+    edited.storeNoteTextFileToDisk(currentNoteTextChanged);
+
+    QFile victimFileAfterEdit(victimFilePath);
+    QVERIFY2(victimFileAfterEdit.exists(), "the victim note's file should still be present");
+    QVERIFY2(victimFileAfterEdit.size() > 0,
+             "editing an unrelated note's title to collide with the victim, with no import and "
+             "no dedicated rename action involved, must not destroy the victim's content");
+}
+
+/**
+ * Direct regression test for the excludeNoteId parameter added to
+ * Note::fetchByFileName()/fillByFileName(), per pbek's review comment on this
+ * PR: without it, the collision-avoidance loop excluded "myself" only *after*
+ * fetching a single row -- SQLite gives no ordering guarantee without ORDER
+ * BY -- so on a database that already has two rows sharing the same
+ * (file_name, note_sub_folder_id) from before this fix existed, there was a
+ * real chance the query would hand back the calling note's own row, get
+ * waved through by the self-id check, and never surface the genuine
+ * remaining duplicate at all.
+ *
+ * This constructs that already-corrupted state directly (two notes stored
+ * with an identical file_name in the same subfolder, via the raw store()
+ * used to seed test data rather than the app's own collision-avoidance path)
+ * and asserts the new parameter deterministically finds the *other* row,
+ * regardless of which of the two ids is excluded.
+ */
+void TestNotes::testFetchByFileNameExcludesGivenNoteIdAmongDuplicates() {
+    NoteSubFolder targetFolder =
+        createTestNoteSubFolder(uniqueTestName(QStringLiteral("corrupted-notebook")));
+
+    const QString sharedName = uniqueTestName(QStringLiteral("Shared"));
+    const QString sharedFileName = sharedName + QStringLiteral(".md");
+
+    Note noteX;
+    noteX.setNoteSubFolder(targetFolder);
+    noteX.setName(sharedName);
+    QVERIFY(noteX.store());
+    QCOMPARE(noteX.getFileName(), sharedFileName);
+
+    Note noteY;
+    noteY.setNoteSubFolder(targetFolder);
+    noteY.setName(sharedName);
+    QVERIFY(noteY.store());
+    QCOMPARE(noteY.getFileName(), sharedFileName);
+
+    QVERIFY(noteX.getId() != noteY.getId());
+
+    const Note foundExcludingX =
+        Note::fetchByFileName(sharedFileName, targetFolder.getId(), noteX.getId());
+    QVERIFY2(foundExcludingX.isFetched(),
+             "excluding note X must still surface note Y's duplicate row");
+    QCOMPARE(foundExcludingX.getId(), noteY.getId());
+
+    const Note foundExcludingY =
+        Note::fetchByFileName(sharedFileName, targetFolder.getId(), noteY.getId());
+    QVERIFY2(foundExcludingY.isFetched(),
+             "excluding note Y must still surface note X's duplicate row");
+    QCOMPARE(foundExcludingY.getId(), noteX.getId());
+}
+
+/**
+ * Direct regression test for canWriteToNoteFile()'s writability probe, per
+ * pbek's review comment on this PR: opening with QIODevice::ReadWrite (the
+ * fix in place before this test was added) requires read permission in
+ * addition to write permission, so it misreported "can't write" for a file
+ * that has write permission but not read permission -- something an actual
+ * write (opened WriteOnly, which needs no read access) would have handled
+ * fine. QIODevice::WriteOnly | QIODevice::Append avoids that false negative
+ * while still not truncating, unlike bare WriteOnly (the original bug this
+ * whole PR exists to close).
+ */
+void TestNotes::testCanWriteToNoteFileSucceedsWithoutReadPermission() {
+#ifdef Q_OS_UNIX
+    if (::geteuid() == 0) {
+        QSKIP("running as root -- file permission bits aren't enforced, test is meaningless");
+    }
+
+    const QString title = uniqueTestName(QStringLiteral("Write Only Permissions"));
+    Note note;
+    note.setNoteText(QStringLiteral("# %1\n\nOriginal content\n").arg(title));
+    QVERIFY(note.handleNoteTextFileName());
+    QVERIFY(note.store());
+    QVERIFY(note.storeNoteTextFileToDisk());
+
+    const QString path = note.fullNoteFilePath();
+    QVERIFY(QFile::exists(path));
+
+    QByteArray originalContent;
+    {
+        QFile file(path);
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        originalContent = file.readAll();
+    }
+    QVERIFY(!originalContent.isEmpty());
+
+    // Write-only, no read permission for anyone -- an unusual but valid state
+    // (e.g. after a restrictive umask or an external sync tool).
+    QVERIFY(QFile::setPermissions(path, QFileDevice::WriteOwner));
+
+    QVERIFY2(note.canWriteToNoteFile(),
+             "a write-only-permissioned file is still writable and must not be misreported as "
+             "unwritable");
+
+    // Restore read permission so the test itself can verify the content --
+    // the probe must never have truncated the file as a side effect.
+    QVERIFY(QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner));
+
+    QFile fileAfter(path);
+    QVERIFY(fileAfter.open(QIODevice::ReadOnly));
+    QCOMPARE(fileAfter.readAll(), originalContent);
+    fileAfter.close();
+#else
+    QSKIP("POSIX permission bits test only applies on unix-like platforms");
+#endif
 }
 
 // QTEST_MAIN(TestNotes)

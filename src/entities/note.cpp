@@ -1016,14 +1016,14 @@ Note Note::fetchByName(const QRegularExpression &regExp, int noteSubFolderId) {
     return Note();
 }
 
-Note Note::fetchByFileName(const QString &fileName, int noteSubFolderId) {
+Note Note::fetchByFileName(const QString &fileName, int noteSubFolderId, int excludeNoteId) {
     Note note;
     // get the active note subfolder id if none was set
     if (noteSubFolderId == -1) {
         noteSubFolderId = NoteSubFolder::activeNoteSubFolderId();
     }
 
-    note.fillByFileName(fileName, noteSubFolderId);
+    note.fillByFileName(fileName, noteSubFolderId, excludeNoteId);
     return note;
 }
 
@@ -1032,7 +1032,7 @@ Note Note::fetchByFileName(const QString &fileName, const QString &noteSubFolder
     return fetchByFileName(fileName, noteSubFolder.getId());
 }
 
-bool Note::fillByFileName(const QString &fileName, int noteSubFolderId) {
+bool Note::fillByFileName(const QString &fileName, int noteSubFolderId, int excludeNoteId) {
     const QSqlDatabase db = QSqlDatabase::database(QStringLiteral("memory"));
     QSqlQuery query(db);
 
@@ -1041,11 +1041,25 @@ bool Note::fillByFileName(const QString &fileName, int noteSubFolderId) {
         noteSubFolderId = NoteSubFolder::activeNoteSubFolderId();
     }
 
-    query.prepare(
-        QStringLiteral("SELECT * FROM note WHERE file_name = :file_name AND "
-                       "note_sub_folder_id = :note_sub_folder_id"));
+    // Excluding by id directly in the query (rather than fetching and
+    // checking the id afterwards) matters for databases already affected by
+    // the duplicate-name bug this is guarding against: with duplicate rows
+    // for the same (file_name, note_sub_folder_id) already present, SQLite's
+    // row order without ORDER BY is unspecified, so a post-fetch self-check
+    // could land on the caller's own row first and miss the other duplicate
+    // entirely.
+    QString queryString = QStringLiteral(
+        "SELECT * FROM note WHERE file_name = :file_name AND "
+        "note_sub_folder_id = :note_sub_folder_id");
+    if (excludeNoteId > 0) {
+        queryString += QStringLiteral(" AND id != :exclude_note_id");
+    }
+    query.prepare(queryString);
     query.bindValue(QStringLiteral(":file_name"), fileName);
     query.bindValue(QStringLiteral(":note_sub_folder_id"), noteSubFolderId);
+    if (excludeNoteId > 0) {
+        query.bindValue(QStringLiteral(":exclude_note_id"), excludeNoteId);
+    }
 
     if (!query.exec()) {
         qWarning() << __func__ << ": " << query.lastError();
@@ -2936,8 +2950,43 @@ bool Note::handleNoteTextFileName() {
             int nameCount = 0;
             const QString nameBase = name;
 
-            // check if note with this filename already exists
-            while (Note::fetchByFileName(fileName).isFetched()) {
+            // Check if a *different* note with this filename already exists
+            // in the subfolder this note is actually being stored in.
+            //
+            // Without the explicit subfolder id, fetchByFileName() falls
+            // back to whatever subfolder happens to be active in the UI,
+            // which is frequently not this note's own subfolder (e.g.
+            // during a Joplin/Evernote import into a specific target
+            // subfolder) -- that let two notes with an identical title
+            // inside the same target subfolder collide undetected, silently
+            // overwriting one another on disk.
+            //
+            // Excluding this note's own id matters because
+            // handleNoteTextFileName() is called again for every note from
+            // storeNoteTextFileToDisk() (up to a few times per note during
+            // import, as image/attachment handling re-save the note text).
+            // The note's *text* never has its title line rewritten with the
+            // chosen suffix (see the comment below), so "name" recomputed
+            // from the text keeps not matching the already-suffixed
+            // "_name" on every later call, re-entering this loop. Once this
+            // note has stored itself once under, say, "Title 1", it would
+            // otherwise find its own row at that candidate and treat it as
+            // a collision with itself, escalating to "Title 2", "Title 3",
+            // ... on every subsequent call instead of keeping its name.
+            //
+            // The exclusion is done inside the query itself (fetchByFileName's
+            // excludeNoteId) rather than via a post-fetch id check, so that a
+            // database already holding duplicate rows for this filename --
+            // the exact state this loop is meant to clean up -- still turns
+            // up the *other* row instead of matching this note's own first.
+            const int excludeNoteId = this->_id > 0 ? this->_id : -1;
+            while (true) {
+                const Note existingNote =
+                    Note::fetchByFileName(fileName, this->_noteSubFolderId, excludeNoteId);
+                if (!existingNote.isFetched()) {
+                    break;
+                }
+
                 // find new filename for the note
                 name = nameBase + QStringLiteral(" ") + QString::number(++nameCount);
                 fileName = generateNoteFileNameFromName(name);
@@ -3001,14 +3050,24 @@ void Note::generateFileNameFromName() { _fileName = generateNoteFileNameFromName
  * @return
  */
 bool Note::canWriteToNoteFile() {
-    QFile file(fullNoteFilePath());
-    const bool canWrite = file.open(QIODevice::WriteOnly);
-    const bool fileExists = file.exists();
+    const QString path = fullNoteFilePath();
+    // Capture existence *before* opening -- opening below can itself create
+    // the file, which would make a post-open check always see it as
+    // "already there".
+    const bool fileExistedBefore = QFile::exists(path);
+
+    QFile file(path);
+    // WriteOnly | Append probes writability without truncating: WriteOnly
+    // alone implies Truncate, but combining it with Append suppresses that,
+    // same as ReadWrite would. Unlike ReadWrite though, this doesn't also
+    // require read permission on the file, so it won't misreport a
+    // write-only-permissioned file as unwritable.
+    const bool canWrite = file.open(QIODevice::WriteOnly | QIODevice::Append);
 
     if (file.isOpen()) {
         file.close();
 
-        if (!fileExists) {
+        if (!fileExistedBefore) {
             file.remove();
         }
     }
@@ -3654,8 +3713,17 @@ bool Note::renameNoteFile(QString newName) {
         return false;
     }
 
-    // check if name already exists
-    const Note existingNote = Note::fetchByName(newName);
+    // Check if a *different* note with this name already exists in the
+    // subfolder this note actually lives in. Same wrong-scope pattern as
+    // handleNoteTextFileName(): without the explicit subfolder id,
+    // fetchByName() falls back to whatever subfolder happens to be active
+    // in the UI, not this note's own -- a false negative here lets
+    // _fileName/_name/store() below run for a name that DOES already exist
+    // in this note's subfolder, and only the final file.rename() call
+    // (which safely refuses when the destination exists) stops the rename
+    // from actually happening -- but by then the DB row has already been
+    // updated to a file_name that doesn't match what's on disk.
+    const Note existingNote = Note::fetchByName(newName, this->_noteSubFolderId);
     if (existingNote.isFetched() && (existingNote.getId() != _id)) {
         return false;
     }
