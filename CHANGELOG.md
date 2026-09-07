@@ -16,6 +16,9 @@
   - Favorite notes with a star and keep them above other notes
   - Create notes from text shared by other Android apps
   - Light and dark themes on Android 9 and newer
+- Fixed notes with duplicate names in the same subfolder potentially overwriting each
+  other's content, and prevented duplicate image and attachment copies during Joplin imports
+  (for [#3726](https://github.com/pbek/QOwnNotes/pull/3726), thank you, @MySkeletonHurts)
 - Added more French translation (thank you, jd-develop)
 
 ## 26.9.1
